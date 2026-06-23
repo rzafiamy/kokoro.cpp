@@ -32,12 +32,51 @@ inline constexpr int kNumChannels = 1;
 inline constexpr size_t kMaxChunkChars = 200;
 inline constexpr int kChunkGapMs = 60;
 
+// Strip characters the synthesizer can't speak and collapse whitespace. Callers
+// often pass markdown (e.g. "**Risk**:", "*   bullet"), and the tokenizer
+// silently drops unknown characters mid-word, producing garbled phonemes at the
+// edges. We keep letters, digits, whitespace, and the punctuation that carries
+// prosody (.,!?;:'"-) and drop the rest, then squeeze runs of spaces/newlines.
+inline std::string sanitize_text(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (unsigned char c : text) {
+        if (std::isalnum(c) || std::isspace(c) || c >= 0x80 /* keep UTF-8 */) {
+            out.push_back(static_cast<char>(c));
+        } else if (std::strchr(".,!?;:'\"-", c)) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            // Replace a dropped symbol with a space so it can't fuse two words.
+            out.push_back(' ');
+        }
+    }
+    // Collapse internal whitespace runs to a single space, keep paragraph breaks
+    // as newlines so split_into_chunks can still use them as boundaries.
+    std::string squeezed;
+    squeezed.reserve(out.size());
+    bool pending_newline = false, pending_space = false;
+    for (char c : out) {
+        if (c == '\n') { pending_newline = true; continue; }
+        if (std::isspace(static_cast<unsigned char>(c))) { pending_space = true; continue; }
+        if (!squeezed.empty()) {
+            if (pending_newline) squeezed.push_back('\n');
+            else if (pending_space) squeezed.push_back(' ');
+        }
+        pending_newline = pending_space = false;
+        squeezed.push_back(c);
+    }
+    return squeezed;
+}
+
 // Split `text` into chunks no longer than kMaxChunkChars, breaking on sentence
 // terminators (.!?) and newlines and keeping the terminator with its sentence.
-// If a single sentence exceeds the cap it is hard-split on whitespace. Returns
-// trimmed, non-empty chunks; falls back to the whole (trimmed) text as one chunk.
+// A .!? only ends a sentence when followed by whitespace or end-of-text, so
+// abbreviations like "e.g." are not fragmented. If a single sentence exceeds the
+// cap it is hard-split on whitespace. The input is sanitized first. Returns
+// trimmed, non-empty chunks; falls back to the whole (sanitized) text as one.
 inline std::vector<std::string> split_into_chunks(
-    const std::string& text, size_t max_chars = kMaxChunkChars) {
+    const std::string& raw_text, size_t max_chars = kMaxChunkChars) {
+    const std::string text = sanitize_text(raw_text);
     auto trim = [](std::string s) {
         const auto not_space = [](unsigned char c) { return !std::isspace(c); };
         s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
@@ -59,9 +98,15 @@ inline std::vector<std::string> split_into_chunks(
 
     std::vector<std::string> chunks;
     std::string current;
-    for (char c : text) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
         current.push_back(c);
-        const bool is_break = c == '.' || c == '!' || c == '?' || c == '\n';
+        // A terminator only breaks if it ends the text or is followed by space.
+        const bool terminator = c == '.' || c == '!' || c == '?';
+        const bool followed_by_space =
+            i + 1 >= text.size() ||
+            std::isspace(static_cast<unsigned char>(text[i + 1]));
+        const bool is_break = c == '\n' || (terminator && followed_by_space);
         if (is_break) {
             push_capped(chunks, current);
             current.clear();
