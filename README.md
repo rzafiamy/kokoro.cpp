@@ -10,6 +10,11 @@
   <img alt="ONNX Runtime" src="https://img.shields.io/badge/runtime-ONNX%201.20.1-005CED?logo=onnx&logoColor=white">
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-444">
   <img alt="License" src="https://img.shields.io/badge/license-see%20LICENSE-green">
+  <a href="https://github.com/olokobayusuf/kokoro.cpp"><img alt="Forked from" src="https://img.shields.io/badge/forked%20from-olokobayusuf%2Fkokoro.cpp-blueviolet?logo=github"></a>
+</p>
+
+<p align="center">
+  <sub>Forked from <a href="https://github.com/olokobayusuf/kokoro.cpp">olokobayusuf/kokoro.cpp</a> — this fork adds <code>kokoro-cli</code> and an OpenAI-compatible <code>kokoro-server</code>.</sub>
 </p>
 
 <p align="center">
