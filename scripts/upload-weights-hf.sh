@@ -27,6 +27,14 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RES_DIR="${SCRIPT_DIR}/../resources"
 
+# Fail early with a clear message rather than a deep traceback if the user is not
+# authenticated.
+if ! WHOAMI="$(hf auth whoami 2>/dev/null)" || [ "$WHOAMI" = "Not logged in" ]; then
+    echo "error: not logged in to Hugging Face." >&2
+    echo "       Run 'hf auth login' with a WRITE token (https://huggingface.co/settings/tokens)." >&2
+    exit 1
+fi
+
 # The exact files this build loads (see include/kokoro.kokoro_tts.hpp).
 FILES=(
     "8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb"
@@ -42,8 +50,18 @@ for f in "${FILES[@]}"; do
     fi
 done
 
-echo "📦 Creating repo (if needed): ${REPO}"
-hf repo create "${REPO}" --repo-type model -y >/dev/null 2>&1 || true
+echo "📦 Ensuring repo exists: ${REPO}"
+# Try to create the repo, but don't treat failure as fatal: a fine-grained token
+# may have write-to-existing-repos rights without create rights (403), and the
+# repo may already exist. In all those cases the upload below still works, so we
+# only warn here and let the upload surface any genuine blocker.
+if CREATE_OUT="$(hf repo create "${REPO}" --repo-type model --exist-ok 2>&1)"; then
+    echo "   repo ready."
+else
+    echo "   note: could not create the repo automatically (it may already exist," >&2
+    echo "   or your token lacks create rights). Proceeding to upload..." >&2
+    echo "   If upload fails, create it once at https://huggingface.co/new" >&2
+fi
 
 # Generate a model card (README.md) carrying the attribution/disclaimer. Written
 # to a temp file so nothing is left behind in the working tree.
@@ -97,11 +115,14 @@ CARD_EOF
 
 echo "⬆️  Uploading model card + ${#FILES[@]} weight files to ${REPO}..."
 hf upload "${REPO}" "${CARD}" README.md --repo-type model
-hf upload "${REPO}" "${RES_DIR}" . \
-    --repo-type model \
-    --include "8fbea51ea711*" \
-    --include "67f7dd6fed17*" \
-    --include "c3bf79648d4d*"
+
+# Upload each weight file explicitly. A single folder upload with multiple
+# --include globs proved unreliable (only one file was picked up), so push them
+# one by one, preserving each hashed filename as the path in the repo.
+for f in "${FILES[@]}"; do
+    echo "   → ${f}"
+    hf upload "${REPO}" "${RES_DIR}/${f}" "${f}" --repo-type model
+done
 
 echo "✅ Done. Weights live at: https://huggingface.co/${REPO}"
 echo "   Download them into a local dir and run:"
