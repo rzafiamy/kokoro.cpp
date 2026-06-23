@@ -17,6 +17,10 @@ CTestTestfile.cmake
 _deps/
 compile_commands.json
 
+# Model weights — never committed. Fetched from Hugging Face at runtime
+# (zallama downloads them and passes the local dir via --model).
+/resources/
+
 # Generated audio
 *.wav
 

@@ -44,7 +44,7 @@ kokoro.cpp/
 ├── src/
 │   ├── cli.cpp                  # kokoro-cli
 │   └── server.cpp               # kokoro-server
-├── resources/                   # model weights (Git LFS)
+├── resources/                   # model weights — git-ignored, fetched from HF
 ├── docs/kokoro.py               # original Python source (provenance)
 ├── CMakeLists.txt
 └── bin/                         # build output (git-ignored)
@@ -53,15 +53,42 @@ kokoro.cpp/
 ## Quick Start
 
 > [!NOTE]
-> Requires a C++20 toolchain, CMake ≥ 3.28, and Git (CMake fetches dependencies at configure time). Model weights under `resources/` are stored with **Git LFS** — run `git lfs pull` after cloning.
+> Requires a C++20 toolchain, CMake ≥ 3.28, and Git (CMake fetches dependencies at configure time).
 
 ```sh
 git clone https://github.com/rzafiamy/kokoro.cpp.git
 cd kokoro.cpp
-git lfs pull
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
+```
+
+> [!IMPORTANT]
+> **Model weights are not in this repo.** They live in a Hugging Face model
+> repo and are downloaded separately into a local directory, which you pass via
+> `--model <dir>`. The directory must contain the model files under their
+> original (hashed) filenames — the loader looks them up by those names. Under
+> [zallama](#zallama-integration) this download is handled for you.
+
+### Model weights
+
+This build expects a **muna-transpiled** Kokoro: two ONNX models plus a NumPy
+voice pack, named by content hash. Other public Kokoro repos use incompatible
+layouts (`hexgrad/Kokoro-82M` is PyTorch `.pth`; `nvidia/kokoro-82M-onnx-opt` is
+a single ONNX + `voices.bin` + FST phonemizer), so host **these exact files**:
+
+| Filename (hashed) | Role | Size |
+| --- | --- | --- |
+| `8fbea51ea711…` | acoustic ONNX model | ~311 MB |
+| `67f7dd6fed17…` | phonemizer ONNX model | ~47 MB |
+| `c3bf79648d4d…` | voices (`.npz`) | ~28 MB |
+
+```sh
+# Publish your local weights to a Hugging Face model repo (one-time)
+./scripts/upload-weights-hf.sh <user>/kokoro-onnx
+
+# Fetch them into ./resources for a local run
+./scripts/download-weights-hf.sh <user>/kokoro-onnx resources/
 ```
 
 Binaries are written to `./bin`:
@@ -145,6 +172,7 @@ Request body (`POST /v1/audio/speech`):
 `parakeet-server`, so it plugs into [zallama](https://github.com/rzafiamy) as a
 `tts` backend:
 
+- zallama downloads the weights from Hugging Face into a local directory
 - launched as `kokoro-server --model <dir> --host 127.0.0.1 --port <port>`
 - health-checked on `GET /health`
 - served via `POST /v1/audio/speech`
@@ -152,6 +180,8 @@ Request body (`POST /v1/audio/speech`):
 > [!TIP]
 > kokoro's `--model` is a **resource directory** (not a single weights file),
 > because `muna::Configuration` loads every file in that directory as a manifest.
+> The server itself does **no downloading** — it only reads a local path, which
+> keeps the binary fully standalone (no TLS/HTTP-client dependency).
 
 ## How This Was Generated
 
