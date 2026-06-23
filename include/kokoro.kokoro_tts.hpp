@@ -1165,7 +1165,7 @@ namespace nn {
                     options,
                     COREML_FLAG_ENABLE_ON_SUBGRAPH | COREML_FLAG_CREATE_MLPROGRAM
                 ));
-            #elif defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
+            #elif defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__) && defined(ORT_CUDA_EP_HASH)
             if (acceleration & FXN_ACCELERATION_GPU) {
                 auto cudaPath = configuration.resource(ORT_CUDA_EP_HASH); 
                 FXN_ASSERT(

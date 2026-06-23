@@ -6,7 +6,8 @@ set(CMAKE_SKIP_INSTALL_RULES ON)
 project(kokoro__kokoro_tts LANGUAGES C CXX)
 
 # Options
-option(BUILD_EXAMPLES "Whether to build the example application." ON)
+option(BUILD_CLI "Whether to build the kokoro-cli executable." ON)
+option(BUILD_SERVER "Whether to build the kokoro-server executable." ON)
 
 # Settings
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -57,22 +58,6 @@ set(RANGES_CXX_STD 20)
 set(RANGES_BUILD_CALENDAR_EXAMPLE OFF)
 set(RANGES_NATIVE OFF)
 FetchContent_MakeAvailable(range_v3)
-FetchContent_Declare(
-    stb
-    GIT_REPOSITORY  https://github.com/SavaLione/stb-cmake.git
-    GIT_TAG         1.0.0
-)
-FetchContent_MakeAvailable(stb)
-FetchContent_Declare(
-    AudioFile
-    GIT_REPOSITORY https://github.com/adamstark/AudioFile.git
-    GIT_TAG        1.1.4
-)
-set(_BUILD_EXAMPLES_SAVED ${BUILD_EXAMPLES})
-set(BUILD_EXAMPLES OFF)
-set(BUILD_TESTS OFF)
-FetchContent_MakeAvailable(AudioFile)
-set(BUILD_EXAMPLES ${_BUILD_EXAMPLES_SAVED})
 set(BUILD_ZLIB_DEFAULT_SYSTEMS "Linux;Windows")
 set(BUILD_ZLIB OFF)
 if(CMAKE_SYSTEM_NAME IN_LIST BUILD_ZLIB_DEFAULT_SYSTEMS)
@@ -116,17 +101,57 @@ endif()
 target_include_directories(cnpy-static INTERFACE ${cnpy_SOURCE_DIR})
 target_link_libraries(cnpy-static INTERFACE ${ZLIB_LIBRARY})
 set(ONNXRUNTIME_VERSION 1.20.1)
+set(ONNXRUNTIME_BASE_URL "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v${ONNXRUNTIME_VERSION}")
+
+# Select the prebuilt static ONNX Runtime package matching this platform/arch.
+# Each package ships a single static lib (libonnxruntime.a / onnxruntime.lib)
+# under <root>/lib plus headers under <root>/include.
+set(ONNXRUNTIME_SYSTEM_LIBS "")
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _ort_arch)
+if(APPLE)
+    set(ONNXRUNTIME_ARCHIVE "onnxruntime-osx-universal2-static_lib-${ONNXRUNTIME_VERSION}.zip")
+    set(ONNXRUNTIME_LIB_NAME "libonnxruntime.a")
+    set(ONNXRUNTIME_SYSTEM_LIBS "-framework CoreFoundation;-framework Foundation")
+elseif(WIN32)
+    if(_ort_arch MATCHES "arm64|aarch64")
+        set(ONNXRUNTIME_ARCHIVE "onnxruntime-win-arm64-static_lib-${ONNXRUNTIME_VERSION}.tar.bz2")
+    elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        set(ONNXRUNTIME_ARCHIVE "onnxruntime-win-x86-static_lib-${ONNXRUNTIME_VERSION}.tar.bz2")
+    else()
+        set(ONNXRUNTIME_ARCHIVE "onnxruntime-win-x64-static_lib-${ONNXRUNTIME_VERSION}.tar.bz2")
+    endif()
+    set(ONNXRUNTIME_LIB_NAME "onnxruntime.lib")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(_ort_arch MATCHES "aarch64|arm64")
+        set(ONNXRUNTIME_ARCHIVE "onnxruntime-linux-aarch64-static_lib-${ONNXRUNTIME_VERSION}-glibc2_17.zip")
+    elseif(_ort_arch MATCHES "arm")
+        set(ONNXRUNTIME_ARCHIVE "onnxruntime-linux-arm-static_lib-${ONNXRUNTIME_VERSION}.zip")
+    else()
+        set(ONNXRUNTIME_ARCHIVE "onnxruntime-linux-x64-static_lib-${ONNXRUNTIME_VERSION}-glibc2_17.zip")
+    endif()
+    set(ONNXRUNTIME_LIB_NAME "libonnxruntime.a")
+    # Static ORT pulls in the usual POSIX/runtime deps.
+    set(ONNXRUNTIME_SYSTEM_LIBS "Threads::Threads;${CMAKE_DL_LIBS};rt;m")
+else()
+    message(FATAL_ERROR "No prebuilt static ONNX Runtime for system '${CMAKE_SYSTEM_NAME}' / arch '${CMAKE_SYSTEM_PROCESSOR}'.")
+endif()
+
+if(ONNXRUNTIME_SYSTEM_LIBS MATCHES "Threads::Threads")
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
+endif()
+
 FetchContent_Declare(
-    onnxruntime_macos
-    URL https://github.com/csukuangfj/onnxruntime-libs/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-osx-universal2-static_lib-${ONNXRUNTIME_VERSION}.zip
+    onnxruntime
+    URL "${ONNXRUNTIME_BASE_URL}/${ONNXRUNTIME_ARCHIVE}"
 )
-FetchContent_MakeAvailable(onnxruntime_macos)
+FetchContent_MakeAvailable(onnxruntime)
 add_library(onnxruntime STATIC IMPORTED GLOBAL)
 set_target_properties(
     onnxruntime PROPERTIES
-    IMPORTED_LOCATION "${onnxruntime_macos_SOURCE_DIR}/lib/libonnxruntime.a"
-    INTERFACE_INCLUDE_DIRECTORIES "${onnxruntime_macos_SOURCE_DIR}/include"
-    INTERFACE_LINK_LIBRARIES "-framework CoreFoundation;-framework Foundation"
+    IMPORTED_LOCATION "${onnxruntime_SOURCE_DIR}/lib/${ONNXRUNTIME_LIB_NAME}"
+    INTERFACE_INCLUDE_DIRECTORIES "${onnxruntime_SOURCE_DIR}/include"
+    INTERFACE_LINK_LIBRARIES "${ONNXRUNTIME_SYSTEM_LIBS}"
 )
 FetchContent_Declare(
     simdutf
@@ -178,7 +203,7 @@ target_link_libraries(xtensor INTERFACE xsimd)
 add_library(kokoro__kokoro_tts INTERFACE)
 add_library(kokoro::kokoro_tts ALIAS kokoro__kokoro_tts)
 target_compile_features(kokoro__kokoro_tts INTERFACE cxx_std_20)
-target_include_directories(kokoro__kokoro_tts INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(kokoro__kokoro_tts INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(MSVC)
     target_compile_options(kokoro__kokoro_tts INTERFACE /Zc:preprocessor /utf-8)
 endif()
@@ -195,18 +220,45 @@ target_link_libraries(
     xtensor
 )
 
-# Example application
-if(BUILD_EXAMPLES)
-    add_executable(kokoro__kokoro_tts_example example.cpp)
-    target_link_libraries(kokoro__kokoro_tts_example PRIVATE
+# Binaries are written into ./bin so they sit together (and drop straight into
+# zallama's ./bin layout). Resource files are loaded relative to the working
+# directory at runtime, not relative to the binary.
+set(KOKORO_BIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/bin)
+
+# kokoro-cli: one-shot text -> WAV file (parakeet-cli / llama-cli style).
+if(BUILD_CLI)
+    add_executable(kokoro_cli src/cli.cpp)
+    target_link_libraries(kokoro_cli PRIVATE
         kokoro::kokoro_tts
         cxxopts::cxxopts
-        stb_image::stb_image
-        stb_image_write::stb_image_write
-        AudioFile
     )
-    set_target_properties(kokoro__kokoro_tts_example PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        OUTPUT_NAME kokoro_tts
+    set_target_properties(kokoro_cli PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${KOKORO_BIN_DIR}
+        OUTPUT_NAME kokoro-cli
+    )
+endif()
+
+# kokoro-server: OpenAI-compatible TTS HTTP server (parakeet-server style).
+if(BUILD_SERVER)
+    # cpp-httplib is header-only; no extra system deps, keeps the binary
+    # standalone like the rest of the FetchContent stack.
+    FetchContent_Declare(
+        httplib
+        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+        GIT_TAG        v0.18.3
+        GIT_SHALLOW    TRUE
+        EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(httplib)
+
+    add_executable(kokoro_server src/server.cpp)
+    target_link_libraries(kokoro_server PRIVATE
+        kokoro::kokoro_tts
+        cxxopts::cxxopts
+        httplib::httplib
+    )
+    set_target_properties(kokoro_server PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${KOKORO_BIN_DIR}
+        OUTPUT_NAME kokoro-server
     )
 endif()
