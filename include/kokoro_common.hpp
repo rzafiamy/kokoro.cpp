@@ -32,6 +32,228 @@ inline constexpr int kNumChannels = 1;
 inline constexpr size_t kMaxChunkChars = 200;
 inline constexpr int kChunkGapMs = 60;
 
+// --- English text normalization ---------------------------------------------
+// The ByT5 G2P phonemizer only speaks plain words: digits, ALL-CAPS tokens and
+// symbols like $/% come out garbled or silently dropped ("42" was spoken as
+// "at", "NASA" as "eneza", "AI" disappeared). Upstream Kokoro normalizes text
+// before phonemization (misaki); this port skipped that step, which is what
+// made output sound cut/incorrect. This is a minimal English normalizer:
+//   - integers/decimals ("42", "3.14", "1,000") -> number words
+//   - "$42" / "$4.50" -> dollars and cents, "7%" -> "seven percent"
+//   - ordinals "1st".."42nd" -> "first".."forty second"
+//   - ALL-CAPS: pronounceable words are lowercased ("FINISH" -> "finish"),
+//     acronyms are spelled out ("AI" -> "a i") — the phonemizer reads isolated
+//     lowercase letters as letter names.
+// Only applied when the language is English (the default); other languages
+// pass through unchanged.
+
+inline std::string int_to_words_en(unsigned long long n) {
+    static const char* kOnes[] = {
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+        "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+        "sixteen", "seventeen", "eighteen", "nineteen"};
+    static const char* kTens[] = {"",      "",      "twenty",  "thirty", "forty",
+                                  "fifty", "sixty", "seventy", "eighty", "ninety"};
+    if (n < 20) return kOnes[n];
+    if (n < 100) {
+        std::string s = kTens[n / 10];
+        if (n % 10) s += std::string(" ") + kOnes[n % 10];
+        return s;
+    }
+    if (n < 1000) {
+        std::string s = std::string(kOnes[n / 100]) + " hundred";
+        if (n % 100) s += " " + int_to_words_en(n % 100);
+        return s;
+    }
+    static const std::pair<unsigned long long, const char*> kScales[] = {
+        {1000000000000ULL, "trillion"},
+        {1000000000ULL, "billion"},
+        {1000000ULL, "million"},
+        {1000ULL, "thousand"}};
+    for (const auto& [value, name] : kScales)
+        if (n >= value) {
+            std::string s = int_to_words_en(n / value) + " " + name;
+            if (n % value) s += " " + int_to_words_en(n % value);
+            return s;
+        }
+    return "";
+}
+
+// Read a digit string one digit at a time ("007" -> "zero zero seven"). Used
+// for decimal fractions and numbers too long to say as one quantity.
+inline std::string digits_to_words_en(const std::string& digits) {
+    std::string out;
+    for (char d : digits) {
+        if (!std::isdigit(static_cast<unsigned char>(d))) continue;
+        if (!out.empty()) out += ' ';
+        out += int_to_words_en(static_cast<unsigned long long>(d - '0'));
+    }
+    return out;
+}
+
+inline std::string number_to_words_en(const std::string& digits_with_commas) {
+    std::string digits;
+    for (char c : digits_with_commas)
+        if (std::isdigit(static_cast<unsigned char>(c))) digits.push_back(c);
+    if (digits.empty()) return "";
+    if (digits.size() > 15) return digits_to_words_en(digits);
+    return int_to_words_en(std::stoull(digits));
+}
+
+inline std::string ordinal_to_words_en(unsigned long long n) {
+    std::string words = int_to_words_en(n);
+    const size_t pos = words.find_last_of(' ');
+    std::string last = pos == std::string::npos ? words : words.substr(pos + 1);
+    if (last == "one") last = "first";
+    else if (last == "two") last = "second";
+    else if (last == "three") last = "third";
+    else if (last == "five") last = "fifth";
+    else if (last == "eight") last = "eighth";
+    else if (last == "nine") last = "ninth";
+    else if (last == "twelve") last = "twelfth";
+    else if (last.back() == 'y') last = last.substr(0, last.size() - 1) + "ieth";
+    else last += "th";
+    return pos == std::string::npos ? last : words.substr(0, pos + 1) + last;
+}
+
+// Normalize one whitespace-delimited token's core (punctuation already split
+// off by normalize_token_en). Returns the replacement, or `core` unchanged.
+inline std::string normalize_core_en(const std::string& core) {
+    if (core.empty()) return core;
+    const bool currency = core.front() == '$';
+    std::string body = currency ? core.substr(1) : core;
+    const bool percent = !body.empty() && body.back() == '%';
+    if (percent) body.pop_back();
+    if (body.empty()) return core;
+
+    const auto is_digits = [](const std::string& s, bool commas) {
+        if (s.empty()) return false;
+        bool any = false;
+        for (char c : s) {
+            if (std::isdigit(static_cast<unsigned char>(c))) any = true;
+            else if (!(commas && c == ',')) return false;
+        }
+        return any;
+    };
+
+    // Ordinals: "1st", "22nd", "3rd", "45th" (also uppercase suffixes).
+    if (!currency && !percent && body.size() > 2) {
+        std::string suffix = body.substr(body.size() - 2);
+        for (char& c : suffix) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const std::string head = body.substr(0, body.size() - 2);
+        if ((suffix == "st" || suffix == "nd" || suffix == "rd" || suffix == "th") &&
+            is_digits(head, true) && head.size() <= 15) {
+            std::string digits;
+            for (char c : head)
+                if (c != ',') digits.push_back(c);
+            return ordinal_to_words_en(std::stoull(digits));
+        }
+    }
+
+    // Plain integers and decimals, with optional $ prefix / % suffix.
+    const size_t dot = body.find('.');
+    const std::string int_part = dot == std::string::npos ? body : body.substr(0, dot);
+    const std::string frac_part = dot == std::string::npos ? "" : body.substr(dot + 1);
+    if (is_digits(int_part, true) && body.find('.', dot + 1) == std::string::npos &&
+        (frac_part.empty() ? dot == std::string::npos : is_digits(frac_part, false))) {
+        std::string words = number_to_words_en(int_part);
+        if (currency && frac_part.size() == 2) {
+            words += int_part == "1" ? " dollar" : " dollars";
+            const std::string cents = number_to_words_en(frac_part);
+            words += " and " + cents + (frac_part == "01" ? " cent" : " cents");
+        } else {
+            if (!frac_part.empty()) words += " point " + digits_to_words_en(frac_part);
+            if (currency) words += (int_part == "1" && frac_part.empty()) ? " dollar" : " dollars";
+        }
+        if (percent) words += " percent";
+        return words;
+    }
+
+    // ALL-CAPS words and acronyms (optionally with digits, e.g. "GPT4").
+    if (!currency && !percent) {
+        // Split off a possessive so "NASA's" still matches.
+        std::string stem = body, tail;
+        if (stem.size() > 2 && (stem.compare(stem.size() - 2, 2, "'s") == 0 ||
+                                stem.compare(stem.size() - 2, 2, "'S") == 0)) {
+            tail = "'s";
+            stem = stem.substr(0, stem.size() - 2);
+        }
+        bool caps = stem.size() >= 2, has_letter = false, has_digit = false, has_vowel = false;
+        for (char c : stem) {
+            if (c >= 'A' && c <= 'Z') {
+                has_letter = true;
+                if (std::strchr("AEIOU", c)) has_vowel = true;
+            } else if (std::isdigit(static_cast<unsigned char>(c))) {
+                has_digit = true;
+            } else {
+                caps = false;
+                break;
+            }
+        }
+        if (caps && has_letter) {
+            if (!has_digit && has_vowel && stem.size() >= 4) {
+                // Pronounceable word shouted in caps: just lowercase it.
+                for (char& c : stem) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                return stem + tail;
+            }
+            // Acronym: spell letters, read digit runs as numbers.
+            std::string out;
+            for (size_t i = 0; i < stem.size(); ++i) {
+                if (!out.empty()) out += ' ';
+                if (std::isdigit(static_cast<unsigned char>(stem[i]))) {
+                    size_t j = i;
+                    while (j < stem.size() && std::isdigit(static_cast<unsigned char>(stem[j]))) ++j;
+                    out += number_to_words_en(stem.substr(i, j - i));
+                    i = j - 1;
+                } else {
+                    out += static_cast<char>(std::tolower(static_cast<unsigned char>(stem[i])));
+                }
+            }
+            return out + tail;
+        }
+    }
+    return core;
+}
+
+// Split leading/trailing ASCII punctuation off a token, normalize the core,
+// and reattach the punctuation so prosody marks (.,!?) survive.
+inline std::string normalize_token_en(const std::string& tok) {
+    size_t b = 0, e = tok.size();
+    const auto keep_lead = [](unsigned char c) {
+        return std::isalnum(c) || c >= 0x80 || c == '$';
+    };
+    const auto keep_trail = [](unsigned char c) {
+        return std::isalnum(c) || c >= 0x80 || c == '%';
+    };
+    while (b < e && !keep_lead(static_cast<unsigned char>(tok[b]))) ++b;
+    while (e > b && !keep_trail(static_cast<unsigned char>(tok[e - 1]))) --e;
+    if (b >= e) return tok;
+    const std::string core = tok.substr(b, e - b);
+    const std::string repl = normalize_core_en(core);
+    if (repl == core) return tok;
+    return tok.substr(0, b) + repl + tok.substr(e);
+}
+
+inline std::string normalize_text_en(const std::string& text) {
+    std::string out, tok;
+    out.reserve(text.size() + 16);
+    const auto flush = [&] {
+        if (tok.empty()) return;
+        out += normalize_token_en(tok);
+        tok.clear();
+    };
+    for (char c : text) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            flush();
+            out.push_back(c);
+        } else {
+            tok.push_back(c);
+        }
+    }
+    flush();
+    return out;
+}
+
 // Strip characters the synthesizer can't speak and collapse whitespace. Callers
 // often pass markdown (e.g. "**Risk**:", "*   bullet"), and the tokenizer
 // silently drops unknown characters mid-word, producing garbled phonemes at the
@@ -72,11 +294,14 @@ inline std::string sanitize_text(const std::string& text) {
 // terminators (.!?) and newlines and keeping the terminator with its sentence.
 // A .!? only ends a sentence when followed by whitespace or end-of-text, so
 // abbreviations like "e.g." are not fragmented. If a single sentence exceeds the
-// cap it is hard-split on whitespace. The input is sanitized first. Returns
-// trimmed, non-empty chunks; falls back to the whole (sanitized) text as one.
+// cap it is hard-split on whitespace. The input is normalized (English only)
+// and sanitized first. Returns trimmed, non-empty chunks; falls back to the
+// whole (sanitized) text as one.
 inline std::vector<std::string> split_into_chunks(
-    const std::string& raw_text, size_t max_chars = kMaxChunkChars) {
-    const std::string text = sanitize_text(raw_text);
+    const std::string& raw_text, size_t max_chars = kMaxChunkChars,
+    bool english = true) {
+    const std::string text =
+        sanitize_text(english ? normalize_text_en(raw_text) : raw_text);
     auto trim = [](std::string s) {
         const auto not_space = [](unsigned char c) { return !std::isspace(c); };
         s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
@@ -167,7 +392,8 @@ public:
         const std::string& voice,
         std::optional<std::string> language = std::nullopt,
         std::optional<float> speed = std::nullopt) {
-        const auto chunks = split_into_chunks(text);
+        const bool english = !language || language->rfind("en", 0) == 0;
+        const auto chunks = split_into_chunks(text, kMaxChunkChars, english);
         if (chunks.size() <= 1) {
             // Nothing to gain from chunking; avoid the concat/gap overhead.
             return synthesize_one(chunks.empty() ? text : chunks.front(), voice,

@@ -20,8 +20,8 @@ int main(int argc, char* argv[]) {
         ("t,text", "Text to synthesize.", cxxopts::value<std::string>())
         ("v,voice", "Voice id (see --list-voices).",
             cxxopts::value<std::string>()->default_value("af_heart"))
-        ("l,language", "Language override.", cxxopts::value<std::optional<std::string>>())
-        ("s,speed", "Speaking speed multiplier.", cxxopts::value<std::optional<float>>())
+        ("l,language", "Language override.", cxxopts::value<std::string>())
+        ("s,speed", "Speaking speed multiplier.", cxxopts::value<float>())
         ("o,output", "Output WAV path.", cxxopts::value<std::string>()->default_value("output.wav"))
         ("list-voices", "Print the available voices and exit.")
         ("h,help", "Print help and exit.");
