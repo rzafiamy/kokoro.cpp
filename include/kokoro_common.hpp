@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "kokoro.kokoro_tts.hpp"
+#include "kokoro_espeak.hpp"
 
 namespace kokoro_common {
 
@@ -254,6 +255,295 @@ inline std::string normalize_text_en(const std::string& text) {
     return out;
 }
 
+// --- French text normalization -----------------------------------------------
+// The ByT5 phonemizer garbles digits in French ("250" came back as "tefaʃ",
+// "2024" as "tətfa"), so numbers must be written out before phonemization,
+// like the English path above. Handles cardinals, decimals ("3,14" and
+// "1.000"-style grouping), % / $ / €, ordinals ("1er", "2e", "21ème") and
+// ALL-CAPS acronyms ("IA" -> "i a"), including behind an elision ("d'IA").
+
+inline std::string int_to_words_fr(unsigned long long n) {
+    static const char* kSmall[] = {
+        "zéro", "un", "deux", "trois", "quatre", "cinq", "six", "sept", "huit",
+        "neuf", "dix", "onze", "douze", "treize", "quatorze", "quinze", "seize"};
+    if (n < 17) return kSmall[n];
+    if (n < 20) return std::string("dix-") + kSmall[n - 10];
+    if (n < 70) {
+        static const char* kTens[] = {"", "", "vingt", "trente", "quarante",
+                                      "cinquante", "soixante"};
+        std::string s = kTens[n / 10];
+        if (n % 10 == 1) s += " et un";
+        else if (n % 10) s += std::string("-") + kSmall[n % 10];
+        return s;
+    }
+    if (n < 80) {
+        if (n == 71) return "soixante et onze";
+        return "soixante-" + int_to_words_fr(n - 60);
+    }
+    if (n < 100) {
+        if (n == 80) return "quatre-vingts";
+        return "quatre-vingt-" + int_to_words_fr(n - 80);
+    }
+    if (n < 1000) {
+        std::string s = n / 100 == 1 ? "cent" : int_to_words_fr(n / 100) + " cent";
+        if (n % 100) s += " " + int_to_words_fr(n % 100);
+        else if (n / 100 > 1) s += "s";  // "deux cents"
+        return s;
+    }
+    if (n < 1000000) {
+        std::string s = n / 1000 == 1 ? "mille" : int_to_words_fr(n / 1000) + " mille";
+        if (n % 1000) s += " " + int_to_words_fr(n % 1000);
+        return s;
+    }
+    static const std::pair<unsigned long long, const char*> kScales[] = {
+        {1000000000000ULL, "billion"},
+        {1000000000ULL, "milliard"},
+        {1000000ULL, "million"}};
+    for (const auto& [value, name] : kScales)
+        if (n >= value) {
+            const unsigned long long count = n / value;
+            std::string s = int_to_words_fr(count) + " " + name + (count > 1 ? "s" : "");
+            if (n % value) s += " " + int_to_words_fr(n % value);
+            return s;
+        }
+    return "";
+}
+
+inline std::string digits_to_words_fr(const std::string& digits) {
+    std::string out;
+    for (char d : digits) {
+        if (!std::isdigit(static_cast<unsigned char>(d))) continue;
+        if (!out.empty()) out += ' ';
+        out += int_to_words_fr(static_cast<unsigned long long>(d - '0'));
+    }
+    return out;
+}
+
+inline std::string ordinal_to_words_fr(unsigned long long n) {
+    if (n == 1) return "premier";
+    std::string words = int_to_words_fr(n);
+    const size_t pos = words.find_last_of(' ');
+    std::string last = pos == std::string::npos ? words : words.substr(pos + 1);
+    if (last == "cinq") last = "cinquième";
+    else if (last == "neuf") last = "neuvième";
+    else {
+        if (last.back() == 's' || last.back() == 'e') last.pop_back();
+        last += "ième";
+    }
+    return pos == std::string::npos ? last : words.substr(0, pos + 1) + last;
+}
+
+// Parse a token body as a French number. Separator groups of exactly three
+// digits are thousands grouping ("1.000", "2,500,000"); otherwise a single
+// '.'/',' starts the decimal fraction ("3,14"). Returns false when the body is
+// not a plain number.
+inline bool parse_number_fr(const std::string& body, std::string& int_digits,
+                            std::string& frac_digits) {
+    std::vector<std::string> parts(1);
+    for (char c : body) {
+        if (c == '.' || c == ',') parts.emplace_back();
+        else if (std::isdigit(static_cast<unsigned char>(c))) parts.back().push_back(c);
+        else return false;
+    }
+    for (const auto& p : parts)
+        if (p.empty()) return false;
+    int_digits = parts[0];
+    frac_digits.clear();
+    if (parts.size() == 1) return true;
+    bool grouping = parts[0].size() <= 3;
+    for (size_t i = 1; i < parts.size(); ++i)
+        if (parts[i].size() != 3) grouping = false;
+    if (grouping) {
+        for (size_t i = 1; i < parts.size(); ++i) int_digits += parts[i];
+        return true;
+    }
+    if (parts.size() == 2) {
+        frac_digits = parts[1];
+        return true;
+    }
+    return false;
+}
+
+inline std::string normalize_core_fr(const std::string& core) {
+    if (core.empty()) return core;
+    // Elision ("d'IA", "l'ONU", "qu'en"): normalize what follows the apostrophe.
+    const size_t ap = core.find('\'');
+    if (ap != std::string::npos && ap >= 1 && ap <= 2 && ap + 1 < core.size()) {
+        bool letters = true;
+        for (size_t i = 0; i < ap; ++i)
+            if (!std::isalpha(static_cast<unsigned char>(core[i]))) letters = false;
+        if (letters) {
+            const std::string rest = core.substr(ap + 1);
+            const std::string repl = normalize_core_fr(rest);
+            if (repl != rest) return core.substr(0, ap + 1) + repl;
+        }
+    }
+
+    const bool dollars = core.front() == '$';
+    std::string body = dollars ? core.substr(1) : core;
+    bool euros = false, percent = false;
+    if (body.size() >= 3 && body.compare(body.size() - 3, 3, "\xE2\x82\xAC") == 0) {
+        euros = true;
+        body.resize(body.size() - 3);
+    } else if (!body.empty() && body.back() == '%') {
+        percent = true;
+        body.pop_back();
+    }
+    if (body.empty()) return core;
+
+    // Ordinals: "1er", "1re", "1ère", "2e", "3ème", "21e"…
+    if (!dollars && !euros && !percent) {
+        size_t d = 0;
+        while (d < body.size() && std::isdigit(static_cast<unsigned char>(body[d]))) ++d;
+        if (d > 0 && d < body.size() && d <= 15) {
+            std::string suffix = body.substr(d);
+            for (char& c : suffix) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            const unsigned long long n = std::stoull(body.substr(0, d));
+            if (suffix == "er") return n == 1 ? "premier" : ordinal_to_words_fr(n);
+            if (suffix == "re" || suffix == "ère" || suffix == "ere")
+                return n == 1 ? "première" : ordinal_to_words_fr(n);
+            if (suffix == "e" || suffix == "ème" || suffix == "eme")
+                return n == 1 ? "premier" : ordinal_to_words_fr(n);
+        }
+    }
+
+    // Cardinals and decimals, with optional $ / € / %.
+    std::string int_digits, frac_digits;
+    if (parse_number_fr(body, int_digits, frac_digits) && int_digits.size() <= 15) {
+        std::string words = int_to_words_fr(std::stoull(int_digits));
+        const bool one = int_digits == "1" && frac_digits.empty();
+        if ((dollars || euros) && frac_digits.size() == 2 && frac_digits != "00") {
+            // "4,50 €" -> "quatre euros cinquante"
+            words += dollars ? " dollars " : " euros ";
+            words += int_to_words_fr(std::stoull(frac_digits));
+        } else {
+            if (!frac_digits.empty()) {
+                words += " virgule ";
+                if (frac_digits.size() <= 2 && frac_digits[0] != '0')
+                    words += int_to_words_fr(std::stoull(frac_digits));
+                else
+                    words += digits_to_words_fr(frac_digits);
+            }
+            if (dollars) words += one ? " dollar" : " dollars";
+            if (euros) words += one ? " euro" : " euros";
+        }
+        if (percent) words += " pour cent";
+        return words;
+    }
+
+    // ALL-CAPS acronyms ("IA" -> "i a") and shouted words ("FIN" stays spelled,
+    // "SUPER" -> "super"), mirroring the English heuristic.
+    if (!dollars && !euros && !percent) {
+        bool caps = body.size() >= 2, has_letter = false, has_digit = false, has_vowel = false;
+        for (char c : body) {
+            if (c >= 'A' && c <= 'Z') {
+                has_letter = true;
+                if (std::strchr("AEIOUY", c)) has_vowel = true;
+            } else if (std::isdigit(static_cast<unsigned char>(c))) {
+                has_digit = true;
+            } else {
+                caps = false;
+                break;
+            }
+        }
+        if (caps && has_letter) {
+            if (!has_digit && has_vowel && body.size() >= 4) {
+                std::string low = body;
+                for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                return low;
+            }
+            std::string out;
+            for (size_t i = 0; i < body.size(); ++i) {
+                if (!out.empty()) out += ' ';
+                if (std::isdigit(static_cast<unsigned char>(body[i]))) {
+                    size_t j = i;
+                    while (j < body.size() && std::isdigit(static_cast<unsigned char>(body[j]))) ++j;
+                    out += int_to_words_fr(std::stoull(body.substr(i, j - i)));
+                    i = j - 1;
+                } else {
+                    out += static_cast<char>(std::tolower(static_cast<unsigned char>(body[i])));
+                }
+            }
+            return out;
+        }
+    }
+    return core;
+}
+
+inline std::string normalize_token_fr(const std::string& tok) {
+    size_t b = 0, e = tok.size();
+    const auto keep_lead = [](unsigned char c) {
+        return std::isalnum(c) || c >= 0x80 || c == '$';
+    };
+    const auto keep_trail = [](unsigned char c) {
+        return std::isalnum(c) || c >= 0x80 || c == '%';
+    };
+    while (b < e && !keep_lead(static_cast<unsigned char>(tok[b]))) ++b;
+    while (e > b && !keep_trail(static_cast<unsigned char>(tok[e - 1]))) --e;
+    if (b >= e) return tok;
+    const std::string core = tok.substr(b, e - b);
+    const std::string repl = normalize_core_fr(core);
+    if (repl == core) return tok;
+    return tok.substr(0, b) + repl + tok.substr(e);
+}
+
+inline std::string normalize_text_fr(const std::string& text) {
+    std::string out, tok;
+    out.reserve(text.size() + 16);
+    const auto flush = [&] {
+        if (tok.empty()) return;
+        out += normalize_token_fr(tok);
+        tok.clear();
+    };
+    for (char c : text) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            flush();
+            out.push_back(c);
+        } else {
+            tok.push_back(c);
+        }
+    }
+    flush();
+    return out;
+}
+
+// Map typographic characters to ASCII equivalents before any other processing.
+// The ByT5 phonemizer garbles the multi-byte forms: "l’idée" (U+2019) came back
+// as "lə wide" instead of "lide", and no-break spaces (French spacing before
+// ?!:;) reach the model as raw bytes. Em dash and ellipsis are left alone: the
+// synthesis tokenizer has dedicated tokens for them.
+inline std::string normalize_typography(const std::string& text) {
+    static const std::pair<const char*, const char*> kMap[] = {
+        {"\xE2\x80\x99", "'"},   // ’ right single quote
+        {"\xE2\x80\x98", "'"},   // ‘ left single quote
+        {"\xCA\xBC", "'"},       // ʼ modifier apostrophe
+        {"\xE2\x80\x9C", "\""},  // “ left double quote
+        {"\xE2\x80\x9D", "\""},  // ” right double quote
+        {"\xC2\xAB", "\""},      // « guillemet
+        {"\xC2\xBB", "\""},      // » guillemet
+        {"\xE2\x80\x93", "-"},   // – en dash
+        {"\xC2\xA0", " "},       // no-break space
+        {"\xE2\x80\xAF", " "},   // narrow no-break space
+        {"\xE2\x80\x89", " "},   // thin space
+    };
+    std::string out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size();) {
+        bool matched = false;
+        for (const auto& [from, to] : kMap) {
+            const size_t len = std::strlen(from);
+            if (text.compare(i, len, from) == 0) {
+                out += to;
+                i += len;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) out.push_back(text[i++]);
+    }
+    return out;
+}
+
 // Strip characters the synthesizer can't speak and collapse whitespace. Callers
 // often pass markdown (e.g. "**Risk**:", "*   bullet"), and the tokenizer
 // silently drops unknown characters mid-word, producing garbled phonemes at the
@@ -294,14 +584,17 @@ inline std::string sanitize_text(const std::string& text) {
 // terminators (.!?) and newlines and keeping the terminator with its sentence.
 // A .!? only ends a sentence when followed by whitespace or end-of-text, so
 // abbreviations like "e.g." are not fragmented. If a single sentence exceeds the
-// cap it is hard-split on whitespace. The input is normalized (English only)
-// and sanitized first. Returns trimmed, non-empty chunks; falls back to the
-// whole (sanitized) text as one.
+// cap it is hard-split on whitespace. The input gets typography fixed, then
+// language-specific normalization (English and French), then sanitization.
+// Returns trimmed, non-empty chunks; falls back to the whole (sanitized) text
+// as one.
 inline std::vector<std::string> split_into_chunks(
     const std::string& raw_text, size_t max_chars = kMaxChunkChars,
-    bool english = true) {
-    const std::string text =
-        sanitize_text(english ? normalize_text_en(raw_text) : raw_text);
+    const std::string& language = "en") {
+    std::string text = normalize_typography(raw_text);
+    if (language.rfind("en", 0) == 0) text = normalize_text_en(text);
+    else if (language.rfind("fr", 0) == 0) text = normalize_text_fr(text);
+    text = sanitize_text(text);
     auto trim = [](std::string s) {
         const auto not_space = [](unsigned char c) { return !std::isspace(c); };
         s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
@@ -369,14 +662,48 @@ inline bool is_known_voice(const std::string& voice) {
     return std::find(v.begin(), v.end(), voice) != v.end();
 }
 
+// Language implied by a voice id's prefix (ff_siwis is a French voice, etc.).
+// Used when the caller does not pass a language: the model itself would fall
+// back to en-US, which phonemizes non-English text with English sounds
+// ("Ensuite" came back as "ɛnsuːtiː" instead of "ɑ̃syit").
+inline std::string default_language_for_voice(const std::string& voice) {
+    switch (voice.empty() ? 'a' : voice[0]) {
+        case 'b': return "en-GB";
+        case 'e': return "es-ES";
+        case 'f': return "fr-FR";
+        case 'h': return "hi-IN";
+        case 'i': return "it-IT";
+        case 'j': return "ja-JP";
+        case 'p': return "pt-BR";
+        case 'z': return "zh-CN";
+        default: return "en-US";  // 'a' voices and anything unknown
+    }
+}
+
 // Engine: loads the kokoro model once from a resource directory and synthesizes
 // on demand. Construction is expensive (sessions, voice tables); reuse one
 // instance for the lifetime of the process. Not thread-safe — callers that run
 // it from multiple request handlers must serialize access.
 class Engine {
 public:
-    explicit Engine(const std::filesystem::path& resource_dir)
-        : configuration_(resource_dir), model_(configuration_) {}
+    // `use_espeak` swaps the bundled ByT5 phonemizer (~50 ms per phoneme) for
+    // espeak-ng when libespeak-ng is installed; languages espeak can't cover
+    // (ja/zh) and any espeak failure fall back to the ByT5 per clause.
+    explicit Engine(const std::filesystem::path& resource_dir, bool use_espeak = true)
+        : configuration_(resource_dir), model_(configuration_) {
+        if (use_espeak && kokoro_espeak::Backend::instance().available()) {
+            model_.external_phonemizer = [](const std::string& text,
+                                            const std::string& language) {
+                const std::string voice = kokoro_espeak::voice_for_language(language);
+                if (voice.empty()) return std::string{};
+                return kokoro_espeak::Backend::instance().phonemize(text, voice);
+            };
+            espeak_g2p_ = true;
+        }
+    }
+
+    // True when espeak-ng was found and is used for phonemization.
+    bool espeak_g2p() const { return espeak_g2p_; }
 
     // Synthesize `text` with `voice`, returning mono float samples in [-1, 1] at
     // kSampleRate. `language`/`speed` follow the model defaults when unset.
@@ -392,8 +719,11 @@ public:
         const std::string& voice,
         std::optional<std::string> language = std::nullopt,
         std::optional<float> speed = std::nullopt) {
-        const bool english = !language || language->rfind("en", 0) == 0;
-        const auto chunks = split_into_chunks(text, kMaxChunkChars, english);
+        const std::string lang = language && !language->empty()
+                                     ? *language
+                                     : default_language_for_voice(voice);
+        language = lang;
+        const auto chunks = split_into_chunks(text, kMaxChunkChars, lang);
         if (chunks.size() <= 1) {
             // Nothing to gain from chunking; avoid the concat/gap overhead.
             return synthesize_one(chunks.empty() ? text : chunks.front(), voice,
@@ -429,6 +759,7 @@ private:
 
     muna::Configuration configuration_;
     kokoro::kokoro_tts model_;
+    bool espeak_g2p_ = false;
 };
 
 // Encode mono float samples to a 16-bit PCM WAV byte buffer (RIFF). Returned by

@@ -39,6 +39,7 @@ int main(int argc, char* argv[]) {
             cxxopts::value<std::string>()->default_value("resources/"))
         ("host", "Host/interface to bind.", cxxopts::value<std::string>()->default_value("127.0.0.1"))
         ("p,port", "Port to listen on.", cxxopts::value<int>()->default_value("8080"))
+        ("no-espeak", "Use the bundled (slow) ByT5 phonemizer even when libespeak-ng is installed.")
         ("h,help", "Print help and exit.");
 
     cxxopts::ParseResult args;
@@ -62,11 +63,13 @@ int main(int argc, char* argv[]) {
     std::cerr << "kokoro-server: loading model from '" << model << "'...\n";
     std::optional<kokoro_common::Engine> engine;
     try {
-        engine.emplace(model);
+        engine.emplace(model, !args.count("no-espeak"));
     } catch (const std::exception& e) {
         std::cerr << "fatal: failed to load model: " << e.what() << "\n";
         return 1;
     }
+    std::cerr << "kokoro-server: phonemizer: "
+              << (engine->espeak_g2p() ? "espeak-ng" : "ByT5 (bundled)") << "\n";
     // The engine is not thread-safe; serialize synthesis across httplib's worker
     // threads. TTS requests are CPU-bound and run one-at-a-time anyway.
     std::mutex engine_mutex;

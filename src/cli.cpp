@@ -23,6 +23,7 @@ int main(int argc, char* argv[]) {
         ("l,language", "Language override.", cxxopts::value<std::string>())
         ("s,speed", "Speaking speed multiplier.", cxxopts::value<float>())
         ("o,output", "Output WAV path.", cxxopts::value<std::string>()->default_value("output.wav"))
+        ("no-espeak", "Use the bundled (slow) ByT5 phonemizer even when libespeak-ng is installed.")
         ("list-voices", "Print the available voices and exit.")
         ("h,help", "Print help and exit.");
 
@@ -61,7 +62,9 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        kokoro_common::Engine engine(model);
+        kokoro_common::Engine engine(model, !args.count("no-espeak"));
+        std::cerr << "phonemizer: " << (engine.espeak_g2p() ? "espeak-ng" : "ByT5 (bundled)")
+                  << "\n";
         auto samples = engine.synthesize(text, voice, language, speed);
         auto wav = kokoro_common::encode_wav_pcm16(samples);
 

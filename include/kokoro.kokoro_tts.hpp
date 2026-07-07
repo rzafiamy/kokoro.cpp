@@ -3384,6 +3384,14 @@ namespace kokoro {
             return kokoro__kokoro_tts(text, voice, language, speed);
         }
 
+        // --- Hand-written patch (not generated) ------------------------------
+        // Optional external G2P hook (text, language) -> IPA. When set and it
+        // returns a non-empty string, it replaces the bundled autoregressive
+        // ByT5 phonemizer, which costs ~50 ms per generated phoneme. An empty
+        // return means "can't handle this input" and falls back to the ByT5.
+        std::function<std::string(const std::string&, const std::string&)> external_phonemizer;
+        // --- End hand-written patch -------------------------------------------
+
     private:
         tsl::ordered_map<std::string, int32_t> kokoro__tokenizer;
         numpy::int64 numpy__int64;
@@ -3453,7 +3461,7 @@ namespace kokoro {
                 return DEFAULT_speed;
             };
             speed = speed != std::nullopt ? speed_true() : speed_false();
-            std::string ipa_text = kokoro___convert_to_ipa(text, language.value());
+            std::string ipa_text = kokoro___convert_to_ipa_keep_punct(text, language.value());
             auto lambda_1 = [&](std::string c) -> bool {
                 bool contains_2 = operator_contains_47083529164976(kokoro__tokenizer, c);
                 return contains_2;
@@ -3568,7 +3576,57 @@ namespace kokoro {
             std::string phonemes = builtins_bytes_decode_47083529163296(phoneme_data);
             return phonemes;
         }
-        
+
+        // --- Hand-written patch (not generated) ------------------------------
+        // The ByT5 phonemizer drops punctuation from its IPA output and often
+        // hallucinates phonemes for it ("Et vous ?" came back as "e vu ɛl"),
+        // so the synthesizer never saw the , . ! ? tokens that carry pauses
+        // and intonation (its tokenizer has dedicated ids for them). Split the
+        // text on prosody punctuation, phonemize each clause separately, and
+        // re-attach the marks to the IPA stream.
+        std::string kokoro___convert_to_ipa_keep_punct(const std::string& text, const std::string& language) {
+            static const char* kPunct[] = {
+                ",", ".", "!", "?", ";", ":", "\"",
+                "\xE2\x80\xA6" /* … */, "\xE2\x80\x94" /* — */ };
+            const auto trim = [](const std::string& s) -> std::string {
+                const size_t b = s.find_first_not_of(" \t\r\n");
+                if (b == std::string::npos) return "";
+                const size_t e = s.find_last_not_of(" \t\r\n");
+                return s.substr(b, e - b + 1);
+            };
+            std::string ipa, clause;
+            const auto flush = [&](const char* mark) {
+                const std::string word = trim(clause);
+                clause.clear();
+                if (!word.empty()) {
+                    std::string part;
+                    if (external_phonemizer)
+                        part = trim(external_phonemizer(word, language));
+                    if (part.empty())
+                        part = trim(kokoro___convert_to_ipa(word, language));
+                    if (!part.empty()) {
+                        if (!ipa.empty()) ipa += ' ';
+                        ipa += part;
+                    }
+                }
+                if (mark) ipa += mark;  // attach right after the clause, no space
+            };
+            for (size_t i = 0; i < text.size();) {
+                const char* matched = nullptr;
+                for (const char* p : kPunct)
+                    if (text.compare(i, std::strlen(p), p) == 0) { matched = p; break; }
+                if (matched) {
+                    flush(matched);
+                    i += std::strlen(matched);
+                } else {
+                    clause.push_back(text[i++]);
+                }
+            }
+            flush(nullptr);
+            return ipa;
+        }
+        // --- End hand-written patch -------------------------------------------
+
         std::string format_string_prompt_gpy0(std::string format, std::string language, std::string text) {
             nlohmann::ordered_json args = { };
             std::nullptr_t fmt_language = operator_setitem_47083528645888(args, "language", language);

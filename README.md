@@ -129,10 +129,22 @@ Binaries are written to `./bin`:
 | `-m, --model` | `resources/` | Resource directory with the model files. |
 | `-t, --text` | *(required)* | Text to synthesize. |
 | `-v, --voice` | `af_heart` | Voice id (see `--list-voices`). |
-| `-l, --language` | *(model default)* | Language override. |
+| `-l, --language` | *(from voice)* | Language override (defaults to the voice's language, e.g. `ff_siwis` → `fr-FR`). |
 | `-s, --speed` | `1.0` | Speaking speed multiplier. |
 | `-o, --output` | `output.wav` | Output WAV path. |
+| `--no-espeak` | | Use the bundled (slow) ByT5 phonemizer even when libespeak-ng is installed. |
 | `--list-voices` | | Print available voices and exit. |
+
+### Phonemization backends
+
+Phonemization normally runs on the bundled ByT5 model, which is autoregressive
+and costs roughly 50 ms per phoneme — long texts spend most of their synthesis
+time there. When **libespeak-ng** is installed (`apt install espeak-ng` — the
+shared library and its data files are enough, no dev package needed), it is
+picked up automatically at runtime and phonemizes near-instantly, with better
+stress/prosody marks. Unsupported languages (ja/zh) and any espeak failure fall
+back to the ByT5 per clause. Both binaries log which backend is active at
+startup; `--no-espeak` forces the bundled model.
 
 ## kokoro-server
 
@@ -145,6 +157,7 @@ Binaries are written to `./bin`:
 | `-m, --model` | `resources/` | Resource directory with the model files. |
 | `--host` | `127.0.0.1` | Interface to bind. |
 | `-p, --port` | `8080` | Port to listen on. |
+| `--no-espeak` | | Use the bundled (slow) ByT5 phonemizer even when libespeak-ng is installed. |
 
 ### Endpoints
 
